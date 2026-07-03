@@ -1,0 +1,135 @@
+#!/bin/bash
+#
+# remove_users.sh
+# Interactively removes specified local user accounts from THIS server.
+# Intended to be deployed at /usr/local/sbin/remove_users.sh on each server.
+#
+# Usage:
+#   sudo /usr/local/sbin/remove_users.sh
+#
+# You will be prompted for:
+#   1. The list of usernames to remove
+#   2. Whether to also remove home directories (-r)
+#   3. Confirmation before any changes are made
+#
+# A log file is written to /var/log/user_removal_<timestamp>.log
+
+set -uo pipefail
+
+LOGFILE="/var/log/user_removal_$(date +%Y%m%d_%H%M%S).log"
+REPORTFILE="/var/log/user_removal_report.csv"
+HOSTNAME_LOCAL="$(hostname)"
+
+log() {
+    echo "$1" | tee -a "$LOGFILE"
+}
+
+# Create report file with header if it doesn't exist yet
+if [ ! -f "$REPORTFILE" ]; then
+    echo "date_time,hostname,username,status,home_dir_removed,dry_run" > "$REPORTFILE"
+fi
+
+report() {
+    # args: username, status, home_dir_removed, dry_run
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "${ts},${HOSTNAME_LOCAL},${1},${2},${3},${4}" >> "$REPORTFILE"
+}
+
+# --- Must be root/sudo ---
+if [ "$EUID" -ne 0 ]; then
+    echo "This script must be run as root (use sudo)."
+    exit 1
+fi
+
+# --- Prompt for usernames ---
+echo "Server: $HOSTNAME_LOCAL"
+echo "Enter the username(s) to remove, separated by spaces:"
+read -r -a USERNAMES
+
+if [ ${#USERNAMES[@]} -eq 0 ]; then
+    echo "No usernames entered. Exiting."
+    exit 1
+fi
+
+# --- Remove home directory option ---
+echo "Also remove home directories and mail spool? (y/N):"
+read -r REMOVE_HOME
+if [[ "$REMOVE_HOME" =~ ^[Yy]$ ]]; then
+    USERDEL_FLAGS="-r"
+else
+    USERDEL_FLAGS=""
+fi
+
+# --- Dry run option ---
+echo "Dry run only (show what would happen, make no changes)? (y/N):"
+read -r DRY_RUN_INPUT
+if [[ "$DRY_RUN_INPUT" =~ ^[Yy]$ ]]; then
+    DRY_RUN=true
+else
+    DRY_RUN=false
+fi
+
+# --- Confirmation summary ---
+echo ""
+echo "=================== SUMMARY ==================="
+echo "Server:              $HOSTNAME_LOCAL"
+echo "Users to remove:     ${USERNAMES[*]}"
+echo "userdel flags:       ${USERDEL_FLAGS:-none}"
+echo "Dry run:             $DRY_RUN"
+echo "================================================="
+echo ""
+echo "Type YES to proceed:"
+read -r CONFIRM
+
+if [ "$CONFIRM" != "YES" ]; then
+    echo "Aborted. No changes made."
+    exit 0
+fi
+
+log "=== User removal run started: $(date) on $HOSTNAME_LOCAL ==="
+log "Users: ${USERNAMES[*]}"
+log "Dry run: $DRY_RUN"
+log ""
+
+# --- Main loop ---
+REMOVED_USERS=()
+
+for USERNAME in "${USERNAMES[@]}"; do
+    if id "$USERNAME" >/dev/null 2>&1; then
+        if [ "$DRY_RUN" = true ]; then
+            log "[DRY RUN] Would remove user '$USERNAME' (userdel $USERDEL_FLAGS $USERNAME)"
+            report "$USERNAME" "dry_run_only" "${REMOVE_HOME,,}" "true"
+        else
+            log "Removing user '$USERNAME'..."
+            if userdel $USERDEL_FLAGS "$USERNAME" 2>&1 | tee -a "$LOGFILE"; then
+                log "SUCCESS: '$USERNAME' removed"
+                report "$USERNAME" "removed" "${REMOVE_HOME,,}" "false"
+                REMOVED_USERS+=("$USERNAME")
+            else
+                log "ERROR: failed to remove '$USERNAME'"
+                report "$USERNAME" "failed" "${REMOVE_HOME,,}" "false"
+            fi
+        fi
+    else
+        log "SKIP: user '$USERNAME' does not exist on this server"
+        report "$USERNAME" "skipped_not_found" "${REMOVE_HOME,,}" "$DRY_RUN"
+    fi
+done
+
+log ""
+log "=== User removal run finished: $(date) on $HOSTNAME_LOCAL ==="
+echo ""
+echo "Done. Log written to $LOGFILE"
+echo "Cumulative report: $REPORTFILE"
+echo ""
+echo "----- Accounts successfully removed this run -----"
+if [ ${#REMOVED_USERS[@]} -eq 0 ]; then
+    echo "(none)"
+else
+    TODAY="$(date '+%Y-%m-%d %H:%M:%S')"
+    for U in "${REMOVED_USERS[@]}"; do
+        echo "  $U  -  removed  -  $TODAY  -  $HOSTNAME_LOCAL"
+    done
+fi
+echo "----------------------------------------------------"
