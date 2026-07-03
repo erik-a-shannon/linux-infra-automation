@@ -1,0 +1,126 @@
+#!/bin/bash
+#
+# remove_group_members.sh
+# Removes specified users from specified secondary groups on THIS server.
+# Does NOT delete the user accounts themselves - only their group membership.
+#
+# Usage:
+#   sudo /usr/local/sbin/remove_group_members.sh
+#
+# You will be prompted to paste lines in the format:
+#   groupname username
+# One pair per line. Paste your lines, then press Ctrl+D on an empty line to finish.
+#
+# A cumulative CSV report is written to /var/log/group_removal_report.csv
+
+set -uo pipefail
+
+LOGFILE="/var/log/group_removal_$(date +%Y%m%d_%H%M%S).log"
+REPORTFILE="/var/log/group_removal_report.csv"
+HOSTNAME_LOCAL="$(hostname)"
+
+log() {
+    echo "$1" | tee -a "$LOGFILE"
+}
+
+if [ ! -f "$REPORTFILE" ]; then
+    echo "date_time,hostname,group,username,status" > "$REPORTFILE"
+fi
+
+report() {
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "${ts},${HOSTNAME_LOCAL},${1},${2},${3}" >> "$REPORTFILE"
+}
+
+if [ "$EUID" -ne 0 ]; then
+    echo "This script must be run as root (use sudo)."
+    exit 1
+fi
+
+echo "Server: $HOSTNAME_LOCAL"
+echo "Paste 'groupname username' pairs, one per line."
+echo "When finished, press Enter then Ctrl+D:"
+echo ""
+
+PAIRS=()
+while IFS= read -r LINE; do
+    [ -z "$LINE" ] && continue
+    PAIRS+=("$LINE")
+done
+
+if [ ${#PAIRS[@]} -eq 0 ]; then
+    echo "No pairs entered. Exiting."
+    exit 1
+fi
+
+echo ""
+echo "=================== SUMMARY ==================="
+echo "Server: $HOSTNAME_LOCAL"
+echo "Pairs to process (${#PAIRS[@]}):"
+printf '  %s\n' "${PAIRS[@]}"
+echo "================================================="
+echo ""
+echo "Type YES to proceed:"
+read -r CONFIRM
+
+if [ "$CONFIRM" != "YES" ]; then
+    echo "Aborted. No changes made."
+    exit 0
+fi
+
+log "=== Group removal run started: $(date) on $HOSTNAME_LOCAL ==="
+
+REMOVED=()
+
+for PAIR in "${PAIRS[@]}"; do
+    GROUP=$(echo "$PAIR" | awk '{print $1}')
+    USERNAME=$(echo "$PAIR" | awk '{print $2}')
+
+    if [ -z "$GROUP" ] || [ -z "$USERNAME" ]; then
+        log "SKIP: malformed line '$PAIR'"
+        continue
+    fi
+
+    if ! getent group "$GROUP" >/dev/null 2>&1; then
+        log "SKIP: group '$GROUP' does not exist on this server"
+        report "$GROUP" "$USERNAME" "group_not_found"
+        continue
+    fi
+
+    if ! id "$USERNAME" >/dev/null 2>&1; then
+        log "SKIP: user '$USERNAME' does not exist on this server"
+        report "$GROUP" "$USERNAME" "user_not_found"
+        continue
+    fi
+
+    if ! id -nG "$USERNAME" | tr ' ' '\n' | grep -qx "$GROUP"; then
+        log "SKIP: '$USERNAME' is not currently a member of '$GROUP'"
+        report "$GROUP" "$USERNAME" "not_a_member"
+        continue
+    fi
+
+    log "Removing '$USERNAME' from group '$GROUP'..."
+    if gpasswd -d "$USERNAME" "$GROUP" >>"$LOGFILE" 2>&1; then
+        log "SUCCESS: '$USERNAME' removed from '$GROUP'"
+        report "$GROUP" "$USERNAME" "removed"
+        REMOVED+=("$USERNAME from $GROUP")
+    else
+        log "ERROR: failed to remove '$USERNAME' from '$GROUP'"
+        report "$GROUP" "$USERNAME" "failed"
+    fi
+done
+
+log ""
+log "=== Group removal run finished: $(date) on $HOSTNAME_LOCAL ==="
+echo ""
+echo "Done. Log written to $LOGFILE"
+echo "Cumulative report: $REPORTFILE"
+echo ""
+echo "----- Successfully removed this run -----"
+if [ ${#REMOVED[@]} -eq 0 ]; then
+    echo "(none)"
+else
+    printf '  %s\n' "${REMOVED[@]}"
+fi
+echo "-------------------------------------------"
